@@ -1,0 +1,304 @@
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { ArrowLeft, Check, MessageSquareText, PanelRightOpen, Trash2, X } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { useAuth } from "@/web/auth";
+import { useToast } from "@/web/components/toast";
+import { api, errorMessage } from "@/web/lib/api";
+import { Button } from "@/web/components/ui";
+import type { DraftStatus } from "@/web/hooks/use-draft";
+import { Composer } from "./composer";
+import { ThreadMessage } from "./thread-message";
+import type { Conversation as ConversationModel, Member, MessageKind, SavedReply, Tag, Team } from "./types";
+
+interface ConversationPanelProps {
+  ticketId?: string;
+  conversation: ConversationModel | null;
+  loading: boolean;
+  error: string;
+  onRetry: () => void;
+  hasOlder?: boolean;
+  canLoadOlder?: boolean;
+  loadingOlder?: boolean;
+  onLoadOlder?: () => void;
+  olderError?: string;
+  members: Member[];
+  teams: Team[];
+  availableTags: Tag[];
+  savedReplies: SavedReply[];
+  onBack: () => void;
+  onUpdate: (changes: Record<string, unknown>) => void;
+  onAddTag: (tagId: string) => void;
+  onRemoveTag: (tagId: string) => void;
+  onOpenCustomer: () => void;
+  composerFormRef: React.RefObject<HTMLFormElement | null>;
+  messageKind: MessageKind;
+  onMessageKindChange: (kind: MessageKind) => void;
+  draft: string;
+  onDraftChange: (text: string, html: string) => void;
+  onSend: (input: { attachmentIds: string[] }) => Promise<void>;
+  sending: boolean;
+  draftStatus: DraftStatus;
+  draftSavedAt: Date | null;
+}
+
+export function ConversationPanel({
+  ticketId,
+  conversation,
+  loading,
+  error,
+  onRetry,
+  hasOlder,
+  canLoadOlder,
+  loadingOlder,
+  onLoadOlder,
+  olderError,
+  members,
+  teams,
+  availableTags,
+  savedReplies,
+  onBack,
+  onUpdate,
+  onAddTag,
+  onRemoveTag,
+  onOpenCustomer,
+  composerFormRef,
+  messageKind,
+  onMessageKindChange,
+  draft,
+  onDraftChange,
+  onSend,
+  sending,
+  draftStatus,
+  draftSavedAt,
+}: ConversationPanelProps) {
+  const { session } = useAuth();
+  const navigate = useNavigate();
+  const toast = useToast();
+  const [deleting, setDeleting] = useState(false);
+  const canManage = session?.role === "owner" || session?.role === "admin";
+  // Shares the composer's cache entry; the thread only needs the opt-in flag.
+  const aiQuery = useQuery({
+    queryKey: ["organization-settings"],
+    queryFn: () => api<{ ai: { enabled: boolean; provider: string | null } }>("/organization/settings"),
+    staleTime: 5 * 60_000,
+  });
+
+  async function deleteTicket() {
+    if (!conversation || !window.confirm(`Delete ticket #${conversation.ticket.number}? This cannot be undone.`))
+      return;
+    setDeleting(true);
+    try {
+      await api(`/privacy/tickets/${conversation.ticket.id}`, { method: "DELETE" });
+      toast.push(`Ticket #${conversation.ticket.number} deleted.`, "success");
+      navigate("/inbox");
+    } catch (reason) {
+      toast.push(errorMessage(reason, "The ticket could not be deleted."), "error");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <section className="conversation-panel" aria-label="Selected conversation">
+      {error ? (
+        <div className="conversation-empty">
+          <MessageSquareText size={22} />
+          <h2>Could not open this conversation</h2>
+          <p>{error}</p>
+          <Button variant="secondary" size="small" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      ) : !conversation ? (
+        ticketId && loading ? (
+          <div className="conversation-loading" aria-label="Opening conversation">
+            <span />
+            <span />
+            <span />
+          </div>
+        ) : (
+          <div className="conversation-empty">
+            <MessageSquareText size={22} />
+            <h2>Select a ticket</h2>
+            <p>Open a row from the rundown to read and reply.</p>
+          </div>
+        )
+      ) : (
+        <>
+          <header className="conversation-header">
+            <button className="mobile-back" onClick={onBack} aria-label="Back to ticket list">
+              <ArrowLeft size={18} />
+            </button>
+            <div>
+              <p className="ticket-reference">#{conversation.ticket.number}</p>
+              <h1>{conversation.ticket.subject}</h1>
+            </div>
+            <div className="conversation-actions">
+              <Button
+                variant="secondary"
+                size="small"
+                disabled={conversation.ticket.status === "resolved"}
+                onClick={() => onUpdate({ status: "resolved" })}
+              >
+                <Check size={14} />
+                {conversation.ticket.status === "resolved" ? "Resolved" : "Resolve"}
+              </Button>
+              {canManage && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Delete ticket"
+                  title="Delete ticket"
+                  disabled={deleting}
+                  onClick={() => void deleteTicket()}
+                >
+                  <Trash2 size={16} />
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Customer details"
+                title="Customer details"
+                onClick={onOpenCustomer}
+              >
+                <PanelRightOpen size={17} />
+              </Button>
+            </div>
+          </header>
+          <div className="conversation-context">
+            <label>
+              <span>Status</span>
+              <select
+                aria-label="Ticket status"
+                value={conversation.ticket.status}
+                onChange={(event) => onUpdate({ status: event.target.value })}
+              >
+                <option value="open">Open</option>
+                <option value="pending">Pending</option>
+                <option value="waiting_customer">Waiting</option>
+                <option value="resolved">Resolved</option>
+                <option value="closed">Closed</option>
+              </select>
+            </label>
+            <label>
+              <span>Priority</span>
+              <select
+                aria-label="Ticket priority"
+                value={conversation.ticket.priority}
+                onChange={(event) => onUpdate({ priority: event.target.value })}
+              >
+                <option value="low">Low</option>
+                <option value="normal">Normal</option>
+                <option value="high">High</option>
+                <option value="urgent">Urgent</option>
+              </select>
+            </label>
+            <label>
+              <span>Assignee</span>
+              <select
+                aria-label="Ticket assignee"
+                value={conversation.ticket.assignedUserId ?? ""}
+                onChange={(event) => onUpdate({ assignedUserId: event.target.value || null })}
+              >
+                <option value="">Unassigned</option>
+                {members
+                  .filter((member) => !member.disabledAt)
+                  .map((member) => (
+                    <option key={member.id} value={member.id}>
+                      {member.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+            <label className="team-control">
+              <span>Team</span>
+              <select
+                aria-label="Ticket team"
+                value={conversation.ticket.assignedTeamId ?? ""}
+                onChange={(event) => onUpdate({ assignedTeamId: event.target.value || null })}
+              >
+                <option value="">No team</option>
+                {teams.map((team) => (
+                  <option key={team.id} value={team.id}>
+                    {team.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="context-tags">
+              <span>Tags</span>
+              <div>
+                {conversation.tags.map((tag) => (
+                  <button
+                    key={tag.id}
+                    type="button"
+                    className={`tag-chip tag-${tag.color}`}
+                    onClick={() => onRemoveTag(tag.id)}
+                    title={`Remove ${tag.name}`}
+                  >
+                    {tag.name}
+                    <X size={10} />
+                  </button>
+                ))}
+                <select aria-label="Add tag" value="" onChange={(event) => onAddTag(event.target.value)}>
+                  <option value="">Add tag</option>
+                  {availableTags
+                    .filter((tag) => !conversation.tags.some((current) => current.id === tag.id))
+                    .map((tag) => (
+                      <option key={tag.id} value={tag.id}>
+                        {tag.name}
+                      </option>
+                    ))}
+                </select>
+              </div>
+            </div>
+          </div>
+          <div className="thread">
+            {olderError && (
+              <p className="thread-older-error" role="alert">
+                {olderError}
+                <button type="button" onClick={onLoadOlder}>
+                  Try again
+                </button>
+              </p>
+            )}
+            {hasOlder && (
+              <Button variant="secondary" onClick={onLoadOlder} disabled={loadingOlder || canLoadOlder === false}>
+                {loadingOlder ? "Loading…" : "Load older messages"}
+              </Button>
+            )}
+            {conversation.messages.map((message) => (
+              <ThreadMessage
+                key={message.id}
+                message={message}
+                customerName={conversation.ticket.customerName}
+                customerEmail={conversation.ticket.customerEmail}
+                attachments={conversation.attachments.filter((file) => file.messageId === message.id)}
+                aiEnabled={aiQuery.data?.ai.enabled === true}
+              />
+            ))}
+          </div>
+          <Composer
+            // Remounted per ticket: the pending attachments the composer holds
+            // locally belong to the ticket they were uploaded against.
+            key={conversation.ticket.id}
+            formRef={composerFormRef}
+            ticketId={conversation.ticket.id}
+            kind={messageKind}
+            onKindChange={onMessageKindChange}
+            savedReplies={savedReplies}
+            body={draft}
+            onBodyChange={onDraftChange}
+            onSend={onSend}
+            sending={sending}
+            draftStatus={draftStatus}
+            draftSavedAt={draftSavedAt}
+            customerName={conversation.ticket.customerName}
+          />
+        </>
+      )}
+    </section>
+  );
+}

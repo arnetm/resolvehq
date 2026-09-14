@@ -1,0 +1,159 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "resolvehq",
+  "main": "worker.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"],
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false,
+    },
+  },
+  "upload_source_maps": true,
+  "keep_vars": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "resolvehq",
+      "migrations_dir": "drizzle/migrations","database_id": "f1ad735f-0a9d-4ca6-b9a6-aa55f8fc175f",
+    },
+  ],
+  // Optional Workers AI (free daily allowance; per-workspace opt-in still gates data flow).
+  // Uncomment to prefer Workers AI over OPENAI_API_KEY. Note: with this binding present,
+  // the local dev server opens a remote proxy for AI and needs `wrangler login` or CLOUDFLARE_API_TOKEN.
+  // "ai": {
+  //   "binding": "AI",
+  // },
+  // Optional native outbound email (Cloudflare Email Sending, Workers Paid, beta).
+  // Uncomment only after enabling Email Sending on the zone; the Deploy button
+  // cannot provision it, and on a Free account an unprovisioned binding fails the
+  // deploy. Leaving it commented keeps Resend as the sending provider.
+  // "send_email": [
+  //   {
+  //     "name": "EMAIL",
+  //   },
+  // ],
+  "r2_buckets": [
+    {
+      "binding": "ATTACHMENTS",
+      "bucket_name": "resolvehq-attachments","preview_bucket_name": "resolvehq-attachments",
+    },
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "INBOUND_MAIL_QUEUE",
+        "queue": "resolvehq-inbound-mail",
+      },
+      {
+        "binding": "OUTBOUND_MAIL_QUEUE",
+        "queue": "resolvehq-outbound-mail",
+      },
+      {
+        "binding": "INBOUND_MAIL_DLQ",
+        "queue": "resolvehq-inbound-mail-dlq",
+      },
+      {
+        "binding": "OUTBOUND_MAIL_DLQ",
+        "queue": "resolvehq-outbound-mail-dlq",
+      },
+      {
+        "binding": "MAINTENANCE_QUEUE",
+        "queue": "resolvehq-maintenance",
+      },
+      {
+        "binding": "MAINTENANCE_DLQ",
+        "queue": "resolvehq-maintenance-dlq",
+      },
+    ],
+    "consumers": [
+      {
+        "queue": "resolvehq-inbound-mail",
+        "max_batch_size": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "resolvehq-inbound-mail-dlq",
+      },
+      {
+        "queue": "resolvehq-outbound-mail",
+        "max_batch_size": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "resolvehq-outbound-mail-dlq",
+      },
+      {
+        "queue": "resolvehq-maintenance",
+        "max_batch_size": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "resolvehq-maintenance-dlq",
+      },
+      {
+        "queue": "resolvehq-inbound-mail-dlq",
+        "max_batch_size": 10,
+        "max_retries": 0,
+      },
+      {
+        "queue": "resolvehq-outbound-mail-dlq",
+        "max_batch_size": 10,
+        "max_retries": 0,
+      },
+      {
+        "queue": "resolvehq-maintenance-dlq",
+        "max_batch_size": 10,
+        "max_retries": 0,
+      },
+      // Delivery events for Cloudflare Email Sending. The subscription itself is
+      // not declarable here and is created with
+      //   wrangler queues subscription create resolvehq-email-events \
+      //     --source email.sending --events delivered,bounced,failed,rejected,complained,deferred
+      // Uncomment both consumers only after creating both queues; see
+      // docs/deployment.md.
+      // {
+      //   "queue": "resolvehq-email-events",
+      //   "max_batch_size": 10,
+      //   "max_retries": 3,
+      //   "dead_letter_queue": "resolvehq-email-events-dlq",
+      // },
+      // {
+      //   "queue": "resolvehq-email-events-dlq",
+      //   "max_batch_size": 10,
+      //   "max_retries": 0,
+      // },
+    ],
+  },
+  "ratelimits": [
+    {
+      "name": "AUTH_RATE_LIMIT",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 10,
+        "period": 60,
+      },
+    },
+    {
+      "name": "WRITE_RATE_LIMIT",
+      "namespace_id": "1002",
+      "simple": {
+        "limit": 120,
+        "period": 60,
+      },
+    },
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"],
+  },
+  "vars": {
+    "DEV_MAIL_MODE": "disabled",
+    // Signed plus-address Reply-To on outbound mail. Enable only after adding an Email Routing
+    // catch-all rule for the sending domain, or tagged replies never reach the Worker.
+    // "OUTBOUND_REPLY_TOKEN": "enabled",
+  },
+  "secrets": {
+    "required": ["SESSION_PEPPER"],
+  },
+}

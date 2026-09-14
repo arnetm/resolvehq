@@ -1,0 +1,26 @@
+# Required. At least 32 random characters; used to pepper password and token hashes.
+SESSION_PEPPER=replace-with-at-least-32-random-characters
+
+# Optional. The dev server serves the SPA and /api from a single origin (http://localhost:5173),
+# so the Worker can derive its own origin from the request; APP_URL only overrides it. The same
+# is true in production: the Worker uses the request origin for CSRF checks, cookie security,
+# and links in emails. Set it to pin the origin used in mail sent from cron or queue handlers,
+# which have no incoming request.
+APP_URL=http://localhost:5173
+
+# "capture" records every outgoing email in the mail_captures table (viewable in Settings)
+# instead of sending it. Production defaults to "disabled" via wrangler.jsonc.
+DEV_MAIL_MODE=capture
+
+# Optional. Required to actually send email (ticket replies, password resets, invitations).
+# RESEND_API_KEY=re_...
+# RESEND_WEBHOOK_SECRET=whsec_...
+
+# Optional. Sender for system mail; defaults to no-reply@<your app host>.
+# SYSTEM_MAIL_FROM=no-reply@example.com
+
+# Optional. Adds a Cloudflare Turnstile challenge to sign-in, sign-up, and forgot-password.
+# Both must be set for the widget to appear and be enforced; leave both commented out to
+# keep the feature off entirely.
+# TURNSTILE_SITE_KEY=0x...
+# TURNSTILE_SECRET_KEY=0x...

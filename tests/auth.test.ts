@@ -1,0 +1,535 @@
+import { describe, expect, it, vi } from "vitest";
+import { env } from "cloudflare:test";
+import app from "resolve-server/app";
+import { hashPassword, verifyPassword } from "resolve-server/auth/password";
+import { turnstileEnabled, verifyTurnstile } from "resolve-server/auth/turnstile";
+import { resolveAppUrl } from "resolve-server/lib/app-url";
+import { login, request, signup } from "./helpers";
+
+describe("authentication", () => {
+  it("hashes passwords with a unique salt and verifies them", async () => {
+    const first = await hashPassword("correct horse battery staple", env.SESSION_PEPPER);
+    const second = await hashPassword("correct horse battery staple", env.SESSION_PEPPER);
+    expect(first).not.toBe(second);
+    expect(await verifyPassword("correct horse battery staple", first, env.SESSION_PEPPER)).toBe(true);
+    expect(await verifyPassword("wrong password", first, env.SESSION_PEPPER)).toBe(false);
+  });
+
+  it("keeps the documented local demo credential in sync with the seed", async () => {
+    const seededHash = "pbkdf2-sha256$310000$5YVp6WPqIjWJg4XXdTp-hg$tBZNVDTyqpuZWFVeu3sjpTjVX-05QRkhCDw5HLI-Guk";
+    expect(await verifyPassword("resolve-demo-2026", seededHash, "replace-with-at-least-32-random-characters")).toBe(
+      true,
+    );
+  });
+
+  it("creates an owner session and rejects mutation without CSRF", async () => {
+    const session = await signup("auth");
+    const me = await request("/auth/me", {}, session);
+    expect(me.status).toBe(200);
+    expect(await me.json()).toMatchObject({ role: "owner", organization: { id: session.organizationId } });
+    const rejected = await request("/customers", {
+      method: "POST",
+      body: JSON.stringify({ name: "No CSRF", email: "no-csrf@example.test" }),
+      headers: { cookie: session.cookie, origin: env.APP_URL },
+    });
+    expect(rejected.status).toBe(403);
+  });
+
+  it("resets a password through a captured email link and invalidates old sessions", async () => {
+    const workspace = await signup("reset");
+    const email = "owner-reset@example.test";
+    expect((await request("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email }) })).status).toBe(
+      200,
+    );
+    const capture = await env.DB.prepare(
+      "SELECT text FROM mail_captures WHERE to_address = ? ORDER BY created_at DESC LIMIT 1",
+    )
+      .bind(email)
+      .first<{ text: string }>();
+    const token = /token=([A-Za-z0-9_-]+)/.exec(capture!.text)![1];
+    expect(
+      (
+        await request("/auth/reset-password", {
+          method: "POST",
+          body: JSON.stringify({ token, password: "a-brand-new-password-1" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect((await request("/auth/me", {}, workspace)).status).toBe(401);
+    expect(
+      (
+        await request("/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password: "a-secure-test-password" }),
+        })
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await request("/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password: "a-brand-new-password-1" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request("/auth/reset-password", {
+          method: "POST",
+          body: JSON.stringify({ token, password: "another-new-password-2" }),
+        })
+      ).status,
+    ).toBe(404);
+  });
+
+  it("changes a password with the current one", async () => {
+    const workspace = await signup("change");
+    const email = "owner-change@example.test";
+    const secondSession = await login(email, "a-secure-test-password");
+    expect(
+      (
+        await request(
+          "/auth/change-password",
+          {
+            method: "POST",
+            body: JSON.stringify({ currentPassword: "wrong-password-value", newPassword: "a-brand-new-password-3" }),
+          },
+          workspace,
+        )
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await request(
+          "/auth/change-password",
+          {
+            method: "POST",
+            body: JSON.stringify({ currentPassword: "a-secure-test-password", newPassword: "a-brand-new-password-3" }),
+          },
+          workspace,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request("/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password: "a-brand-new-password-3" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect((await request("/auth/me", {}, workspace)).status).toBe(200);
+    expect((await request("/auth/me", {}, secondSession)).status).toBe(401);
+  });
+
+  it("lets an existing user accept an invitation and switch workspaces", async () => {
+    const host = await signup("invite-host");
+    const guest = await signup("invite-guest");
+    const invitation = (await (
+      await request(
+        "/organization/invitations",
+        { method: "POST", body: JSON.stringify({ email: "owner-invite-guest@example.test", role: "agent" }) },
+        host,
+      )
+    ).json()) as { invitation: { inviteUrl: string } };
+    const token = new URL(invitation.invitation.inviteUrl).searchParams.get("token")!;
+    expect(
+      (await request("/auth/accept-invitation", { method: "POST", body: JSON.stringify({ token }) }, host)).status,
+    ).toBe(409);
+    const accepted = await request(
+      "/auth/accept-invitation",
+      { method: "POST", body: JSON.stringify({ token }) },
+      guest,
+    );
+    expect(accepted.status).toBe(200);
+    const me = (await (await request("/auth/me", {}, guest)).json()) as {
+      organization: { id: string };
+      role: string;
+      workspaces: unknown[];
+    };
+    expect(me.organization.id).toBe(host.organizationId);
+    expect(me.role).toBe("agent");
+    expect(me.workspaces).toHaveLength(2);
+    expect(
+      (
+        await request(
+          "/auth/switch-workspace",
+          { method: "POST", body: JSON.stringify({ organizationId: guest.organizationId }) },
+          guest,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      ((await (await request("/auth/me", {}, guest)).json()) as { organization: { id: string } }).organization.id,
+    ).toBe(guest.organizationId);
+  });
+
+  it("rejects a signed-in accept-invitation without a CSRF token", async () => {
+    const host = await signup("invite-csrf-host");
+    const guest = await signup("invite-csrf-guest");
+    const invitation = (await (
+      await request(
+        "/organization/invitations",
+        { method: "POST", body: JSON.stringify({ email: "owner-invite-csrf-guest@example.test", role: "agent" }) },
+        host,
+      )
+    ).json()) as { invitation: { inviteUrl: string } };
+    const token = new URL(invitation.invitation.inviteUrl).searchParams.get("token")!;
+    const response = await request("/auth/accept-invitation", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+      headers: { cookie: guest.cookie, origin: env.APP_URL },
+    });
+    expect(response.status).toBe(403);
+    const membership = await env.DB.prepare(
+      "SELECT * FROM organization_memberships WHERE organization_id = ? AND user_id = ?",
+    )
+      .bind(host.organizationId, guest.userId)
+      .first();
+    expect(membership).toBeNull();
+  });
+
+  it("creates a default support inbox when signup supplies a support email", async () => {
+    const suffix = "signup-inbox";
+    const response = await request("/auth/signup", {
+      method: "POST",
+      body: JSON.stringify({
+        name: `Owner ${suffix}`,
+        email: `owner-${suffix}@example.test`,
+        password: "a-secure-test-password",
+        organizationName: `Workspace ${suffix}`,
+        organizationSlug: `workspace-${suffix}`,
+        supportEmail: `Support-${suffix}@Example.test`,
+      }),
+    });
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as { csrfToken: string; user: { id: string }; organization: { id: string } };
+    const cookies = [...(response.headers.get("set-cookie") ?? "").matchAll(/(resolvehq_(?:session|csrf))=([^;,]+)/g)];
+    const session = {
+      cookie: cookies.map((match) => `${match[1]}=${match[2]}`).join("; "),
+      csrf: body.csrfToken,
+      userId: body.user.id,
+      organizationId: body.organization.id,
+    };
+
+    const settings = (await (await request("/organization/settings", {}, session)).json()) as {
+      inboxes: Array<{ name: string; emailAddress: string; isDefault: boolean }>;
+    };
+    expect(settings.inboxes).toHaveLength(1);
+    expect(settings.inboxes[0]).toMatchObject({
+      name: "Support",
+      emailAddress: `support-${suffix}@example.test`,
+      isDefault: true,
+    });
+    expect(
+      await env.DB.prepare("SELECT support_email FROM organizations WHERE id = ?")
+        .bind(session.organizationId)
+        .first<{ support_email: string }>(),
+    ).toMatchObject({ support_email: `support-${suffix}@example.test` });
+
+    const customer = (await (
+      await request(
+        "/customers",
+        { method: "POST", body: JSON.stringify({ name: "Signup Customer", email: `customer-${suffix}@example.test` }) },
+        session,
+      )
+    ).json()) as { customer: { id: string } };
+    const ticket = await request(
+      "/tickets",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          customerId: customer.customer.id,
+          subject: "Inbox came from signup",
+          message: "No manual inbox creation needed.",
+        }),
+      },
+      session,
+    );
+    expect(ticket.status).toBe(201);
+
+    const duplicate = await request("/auth/signup", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Second Owner",
+        email: `owner-${suffix}-2@example.test`,
+        password: "a-secure-test-password",
+        organizationName: "Second Workspace",
+        organizationSlug: `workspace-${suffix}-2`,
+        supportEmail: `support-${suffix}@example.test`,
+      }),
+    });
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toMatchObject({ error: { code: "inbox_address_exists" } });
+    expect(
+      await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(`owner-${suffix}-2@example.test`).first(),
+    ).toBeNull();
+  });
+
+  it("falls back to the request origin when APP_URL is not configured", async () => {
+    const workspace = await signup("no-app-url");
+    const unsetEnv = { ...env, APP_URL: undefined } as unknown as typeof env;
+    const withOrigin = (origin: string) =>
+      app.request(
+        "http://localhost:8787/api/organization/settings",
+        {
+          method: "PATCH",
+          body: JSON.stringify({ name: "Origin Test" }),
+          headers: {
+            "content-type": "application/json",
+            cookie: workspace.cookie,
+            "x-csrf-token": workspace.csrf,
+            origin,
+          },
+        },
+        unsetEnv,
+      );
+    expect((await withOrigin("http://localhost:8787")).status).toBe(200);
+    const rejected = await withOrigin("https://evil.example");
+    expect(rejected.status).toBe(403);
+    expect(((await rejected.json()) as { error: { code: string } }).error.code).toBe("invalid_origin");
+
+    expect(resolveAppUrl({ APP_URL: "https://help.example.com/" }, new Request("http://ignored.test/x"))).toBe(
+      "https://help.example.com",
+    );
+    expect(resolveAppUrl({ APP_URL: undefined }, new Request("https://resolvehq.acme.workers.dev/api/x"))).toBe(
+      "https://resolvehq.acme.workers.dev",
+    );
+  });
+});
+
+describe("Turnstile", () => {
+  it("exposes no site key from /auth/config when Turnstile is not configured", async () => {
+    const response = await request("/auth/config");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ turnstileSiteKey: null });
+  });
+
+  it("exposes the public site key from /auth/config only once both keys are configured", async () => {
+    const configuredEnv = { ...env, TURNSTILE_SITE_KEY: "site-key-123", TURNSTILE_SECRET_KEY: "test-secret" };
+    const response = await app.request("http://localhost:8787/api/auth/config", {}, configuredEnv);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ turnstileSiteKey: "site-key-123" });
+  });
+
+  it("hides the site key and skips verification when only the secret key is set", async () => {
+    const configuredEnv = { ...env, TURNSTILE_SECRET_KEY: "test-secret" };
+    const verify = vi.spyOn(globalThis, "fetch");
+    try {
+      const configResponse = await app.request("http://localhost:8787/api/auth/config", {}, configuredEnv);
+      expect(await configResponse.json()).toEqual({ turnstileSiteKey: null });
+
+      const response = await app.request(
+        "http://localhost:8787/api/auth/signup",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "Owner Secret Only",
+            email: "owner-turnstile-secret-only@example.test",
+            password: "a-secure-test-password",
+            organizationName: "Workspace Secret Only",
+            organizationSlug: "workspace-turnstile-secret-only",
+          }),
+        },
+        configuredEnv,
+      );
+      expect(response.status).toBe(201);
+      expect(verify).not.toHaveBeenCalled();
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("hides the site key and skips verification when only the site key is set", async () => {
+    const configuredEnv = { ...env, TURNSTILE_SITE_KEY: "site-key-only-123" };
+    const verify = vi.spyOn(globalThis, "fetch");
+    try {
+      const configResponse = await app.request("http://localhost:8787/api/auth/config", {}, configuredEnv);
+      expect(await configResponse.json()).toEqual({ turnstileSiteKey: null });
+
+      const response = await app.request(
+        "http://localhost:8787/api/auth/signup",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "Owner Site Key Only",
+            email: "owner-turnstile-sitekey-only@example.test",
+            password: "a-secure-test-password",
+            organizationName: "Workspace Site Key Only",
+            organizationSlug: "workspace-turnstile-sitekey-only",
+          }),
+        },
+        configuredEnv,
+      );
+      expect(response.status).toBe(201);
+      expect(verify).not.toHaveBeenCalled();
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("skips verification when Turnstile is not configured", async () => {
+    const verify = vi.spyOn(globalThis, "fetch");
+    try {
+      const session = await signup("turnstile-unset");
+      expect(session.userId).toBeTruthy();
+      expect(verify).not.toHaveBeenCalled();
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("rejects signup without token when Turnstile is configured", async () => {
+    const configuredEnv = { ...env, TURNSTILE_SITE_KEY: "site-key-x", TURNSTILE_SECRET_KEY: "test-secret" };
+    const verify = vi.spyOn(globalThis, "fetch");
+    try {
+      const response = await app.request(
+        "http://localhost:8787/api/auth/signup",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "Owner Turnstile",
+            email: "owner-turnstile-required@example.test",
+            password: "a-secure-test-password",
+            organizationName: "Workspace Turnstile",
+            organizationSlug: "workspace-turnstile-required",
+          }),
+        },
+        configuredEnv,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: "turnstile_failed" } });
+      // No token was supplied, so the CPU-costly siteverify call (and password hashing) never happens.
+      expect(verify).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare("SELECT id FROM users WHERE email = ?")
+          .bind("owner-turnstile-required@example.test")
+          .first(),
+      ).toBeNull();
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("accepts signup once Turnstile verification succeeds", async () => {
+    const configuredEnv = { ...env, TURNSTILE_SITE_KEY: "site-key-x", TURNSTILE_SECRET_KEY: "test-secret" };
+    const verify = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ success: true }));
+    try {
+      const response = await app.request(
+        "http://localhost:8787/api/auth/signup",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "Owner Turnstile Ok",
+            email: "owner-turnstile-ok@example.test",
+            password: "a-secure-test-password",
+            organizationName: "Workspace Turnstile Ok",
+            organizationSlug: "workspace-turnstile-ok",
+            turnstileToken: "valid-token",
+          }),
+        },
+        configuredEnv,
+      );
+      expect(response.status).toBe(201);
+      expect(verify).toHaveBeenCalledTimes(1);
+      expect(verify.mock.calls[0][0]).toBe("https://challenges.cloudflare.com/turnstile/v0/siteverify");
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("rejects login when Turnstile verification fails and does not create a session", async () => {
+    // Verification runs before the user lookup, so it rejects even a nonexistent account
+    // without ever touching the database — this exercises the login path in isolation.
+    const configuredEnv = { ...env, TURNSTILE_SITE_KEY: "site-key-x", TURNSTILE_SECRET_KEY: "test-secret" };
+    const verify = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ success: false }));
+    try {
+      const response = await app.request(
+        "http://localhost:8787/api/auth/login",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            email: "owner-turnstile-login@example.test",
+            password: "a-secure-test-password",
+            turnstileToken: "bad-token",
+          }),
+        },
+        configuredEnv,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: "turnstile_failed" } });
+      expect(response.headers.get("set-cookie")).toBeNull();
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("rejects forgot-password without a token when Turnstile is configured", async () => {
+    const configuredEnv = { ...env, TURNSTILE_SITE_KEY: "site-key-x", TURNSTILE_SECRET_KEY: "test-secret" };
+    const verify = vi.spyOn(globalThis, "fetch");
+    try {
+      const response = await app.request(
+        "http://localhost:8787/api/auth/forgot-password",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ email: "nobody@example.test" }),
+        },
+        configuredEnv,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: "turnstile_failed" } });
+      expect(verify).not.toHaveBeenCalled();
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("is enabled only when both keys are set", () => {
+    expect(turnstileEnabled({ TURNSTILE_SITE_KEY: undefined, TURNSTILE_SECRET_KEY: undefined })).toBe(false);
+    expect(turnstileEnabled({ TURNSTILE_SITE_KEY: "site", TURNSTILE_SECRET_KEY: undefined })).toBe(false);
+    expect(turnstileEnabled({ TURNSTILE_SITE_KEY: undefined, TURNSTILE_SECRET_KEY: "secret" })).toBe(false);
+    expect(turnstileEnabled({ TURNSTILE_SITE_KEY: "site", TURNSTILE_SECRET_KEY: "secret" })).toBe(true);
+  });
+
+  it("posts the token, secret, and remote IP to siteverify", async () => {
+    const verify = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ success: true }));
+    try {
+      const ok = await verifyTurnstile(
+        { TURNSTILE_SITE_KEY: "site", TURNSTILE_SECRET_KEY: "shh-secret" },
+        "a-token",
+        "203.0.113.4",
+      );
+      expect(ok).toBe(true);
+      expect(verify).toHaveBeenCalledTimes(1);
+      const [url, init] = verify.mock.calls[0];
+      expect(url).toBe("https://challenges.cloudflare.com/turnstile/v0/siteverify");
+      expect(init?.method).toBe("POST");
+      const body = init?.body as URLSearchParams;
+      expect(body.get("secret")).toBe("shh-secret");
+      expect(body.get("response")).toBe("a-token");
+      expect(body.get("remoteip")).toBe("203.0.113.4");
+    } finally {
+      verify.mockRestore();
+    }
+  });
+
+  it("fails closed on a network error", async () => {
+    const verify = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"));
+    try {
+      const ok = await verifyTurnstile(
+        { TURNSTILE_SITE_KEY: "site", TURNSTILE_SECRET_KEY: "shh-secret" },
+        "a-token",
+        "203.0.113.4",
+      );
+      expect(ok).toBe(false);
+    } finally {
+      verify.mockRestore();
+    }
+  });
+});
